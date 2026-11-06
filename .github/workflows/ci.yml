@@ -1,0 +1,26 @@
+name: Tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22.22.2
+      - run: npm test
+      - name: Fetch pinned integration fixtures (checksums required)
+        run: python3 scripts/fetch-test-tools.py "$RUNNER_TEMP/pi-context-fixtures"
+      - name: Real Pi + pi-ollama, both registration orders
+        env:
+          PI_BINARY: ${{ runner.temp }}/pi-context-fixtures/pi/pi/pi
+          PI_OLLAMA_EXTENSION: ${{ runner.temp }}/pi-context-fixtures/discovery/package/extensions/index.ts
+        run: npm run test:pi
+      - run: npm pack --dry-run

@@ -1,0 +1,44 @@
+{
+  "name": "pi-ollama-context",
+  "version": "0.1.0",
+  "description": "Verified, persistent Ollama context windows from Pi's /context command",
+  "type": "module",
+  "license": "MIT",
+  "author": "Reen06",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Reen06/pi-ollama-context.git"
+  },
+  "homepage": "https://github.com/Reen06/pi-ollama-context#readme",
+  "bugs": {
+    "url": "https://github.com/Reen06/pi-ollama-context/issues"
+  },
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "ollama",
+    "context-window"
+  ],
+  "engines": {
+    "node": ">=22.19.0"
+  },
+  "pi": {
+    "extensions": [
+      "./src/index.ts"
+    ]
+  },
+  "files": [
+    "src",
+    "README.md",
+    "LICENSE",
+    "docs",
+    "SECURITY.md",
+    "CHANGELOG.md"
+  ],
+  "scripts": {
+    "test": "node --experimental-strip-types --test test/*.test.ts",
+    "test:pi": "node --experimental-strip-types test/pi-integration.ts",
+    "test:ollama": "node --experimental-strip-types test/ollama-integration.ts",
+    "test:smoke": "node --experimental-strip-types test/real-pi-smoke.ts"
+  }
+}
