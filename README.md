@@ -34,7 +34,7 @@ Keep your existing discovery extension installed:
 
 ```sh
 pi install npm:@jamesjfoong/pi-ollama
-pi install git:github.com/Reen06/pi-ollama-context@v0.1.0
+pi install git:github.com/Reen06/pi-ollama-context@v0.2.0
 ```
 
 Restart Pi (or `/reload`), select an **ollama** model, then:
@@ -60,6 +60,10 @@ networking settings. An Ollama server on your LAN still requires LAN access.
 | `/context 8192` | Set 8,192 tokens |
 | `/context 16k` | Set 16,384 tokens; `k` means 1,024 |
 | `/context show` | Read allocation/status without loading a model |
+| `/context auto` | Choose an auto-compaction threshold interactively |
+| `/context auto 80` | Compact at 80% (custom whole percentages 1–95 accepted) |
+| `/context auto off` | Disable threshold compaction for this managed model; manual/overflow recovery remains |
+| `/context auto show` | Show usage and whether the threshold is active |
 | `/context reset` | Remove the saved preference and select the untouched original; requires an empty `/new` session |
 
 Custom values must be whole numbers between 512 and 1,048,576, and must not
@@ -102,25 +106,82 @@ routes to catalog models, so this separate catalog is necessary to preserve
 correct limits across discovery refreshes. No inference transport is reimplemented.
 See [architecture](docs/architecture.md).
 
+## Usage footer and native auto-compaction
+
+Pi already includes a context percentage in its native footer and `/compact`.
+This extension adds a compact status line with an explicit numerator and your
+managed model's verified capacity:
+
+```text
+ctx ~6,144 / 8,192 · 75.0% · auto 80%
+```
+
+Usage comes from Pi's **current conversation** accounting, not cumulative session
+billing totals or Ollama's memory allocation. It includes provider-reported usage
+and estimates for newer messages. `~` means estimated. The display refreshes after
+assistant/tool messages, turns, model changes and compaction. It is not a live
+per-token GPU cache monitor. After compaction Pi can report usage as unknown until
+the next response: the footer shows `?`, never the stale pre-compaction percentage.
+
+```text
+/context auto       # selector: presets, custom percentage, or off
+/context auto 70    # set your own threshold for this model
+/context auto 80    # default
+/context auto off   # disable threshold compaction for this model
+/context auto show
+/compact           # Pi's native manual compaction
+```
+
+The threshold persists per original model and endpoint, and survives context-size
+changes. New `/context SIZE` selections configure 80% by default. **Upgrading from
+0.1.0:** install the new tag, restart Pi, select your managed model and run
+`/context auto 80` once to activate its native budgets. Pending/overridden settings
+are labelled in the footer rather than falsely reported as active.
+
+The extension writes only its own exact model keys in
+`~/.pi/agent/settings.json` (or `$PI_CODING_AGENT_DIR/settings.json`), takes a private
+backup before edits, uses Pi's settings-lock convention and reloads Pi automatically
+to activate the change. Conversation history is preserved by that reload. It does
+not change the global compaction switch or other providers. If Pi auto-compaction
+is disabled in `/settings`, the footer says so; enable it there if desired.
+Project settings can override the saved values and are never rewritten.
+
+Pi's native compaction runs at its next eligible checkpoint once usage reaches the
+threshold **and enough history exists to summarize**. It does not interrupt each
+streaming token. Pi generates the summary and keeps the original session log. The
+retained recent-history budget scales down to at most 1/16 of the small context,
+so Pi's default 20K retained history cannot prevent a 4K/8K session from compacting.
+The remaining history is summarized, not deleted from the session file. Very low
+thresholds cause frequent summaries; high thresholds leave less headroom for tool
+results and replies. An unusually large single message can still exceed capacity.
+
+The footer shows `compacting…` during summarization and reports failures. Manual
+`/compact` and Pi's overflow recovery remain available even with our threshold off.
+Compaction can lose detail, and model-generated summaries can contain mistakes.
+It helps manage context pressure; it **does not guarantee against hallucinations**.
+
 ## Conversations and small contexts
 
-The command does not clear or rewrite history. It refuses changes when a turn
-or queued message is active. Existing text is checked against a conservative
-UTF-8 byte bound plus an output reserve; every routed request is checked again,
-including the system prompt and tool definitions. This is **not an exact tokenizer**
-and can reject a conversation that would actually fit. Use a larger context,
-`/compact` while the larger model is still selected, or `/new`.
+Changing capacity does not clear or rewrite history and is refused during active
+turns/queued messages. For a new capacity, the conservative UTF-8 byte bound plus
+output reserve remains in place. For ordinary requests after this managed model
+has responded, the guard uses Pi's current usage estimate, including newer content,
+plus the output reserve. Unknown usage falls back to the byte bound. Neither is
+an exact model-specific tokenizer. Native compaction requests are budgeted by Pi's
+summary generator using the verified physical model limits; the source history is
+not incorrectly treated as the final summarization prompt.
 
 A full coding-agent prompt/toolset may not fit a 4K or 8K safety budget. For a
 minimal text-only session, Pi supports `--no-tools --system-prompt "Reply briefly."`.
-This release favors refusing uncertain fits over silently truncating a conversation.
-It reserves between 128 and 2,048 output tokens (one eighth of the selected context,
-capped at those limits). Pi's premature threshold compaction is cancelled only
-when measured usage still fits; manual/overflow compaction is not disabled.
+Keep a larger window, `/compact`, or start `/new` when needed. The request output
+reserve remains between 128 and 2,048 tokens (one eighth of the context). Ordinary
+managed requests explicitly send Ollama’s `max_tokens` limit; a smaller caller
+limit is preserved. This prevents a missing transport limit from consuming the
+space reserved for the response.
 
 ## Compatibility and limitations
 
-- Tested together: **Pi 1.3.0 + pi-ollama 1.0.3**, both extension orders, including
+- Tested together: **Pi 1.3.0 + pi-ollama 1.0.3**, both extension orders, including native threshold compaction, usage display and
   `/ollama-refresh`, `/ollama-info`, actual inference, restart and model switching.
   No pi-ollama files are changed; all its commands, including `/ollama-fix`, remain registered.
 - Current Pi 1.5 declarations were also reviewed/type-checked; its binary was not
@@ -178,6 +239,7 @@ See [test evidence](docs/testing.md) and [security notes](SECURITY.md).
 
 - [Ollama OpenAI compatibility and context configuration](https://docs.ollama.com/api/openai-compatibility)
 - [Native model creation](https://docs.ollama.com/api/create), [running allocations](https://docs.ollama.com/api/ps)
+- [Pi native compaction](https://pi.dev/docs/latest/compaction), [settings](https://pi.dev/docs/latest/settings)
 - [Pi extensions](https://pi.dev/docs/latest/extensions), [virtual models](https://pi.dev/docs/latest/virtual-models)
 - [pi-ollama](https://github.com/jamesjfoong/pi-ollama)
 

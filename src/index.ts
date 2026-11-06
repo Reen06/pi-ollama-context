@@ -1,4 +1,5 @@
 import type { ExtensionAPI, ExtensionContext } from '@earendil-works/pi-coding-agent';
+import { autoStatus, parseThreshold, thresholdFor, usageText, writeNativeBudget } from './usage.ts';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { Ollama, Store, PRESETS, assertFits, describeAllocation, endpoint, keyFor, outputBudget, parseContext, type RecordEntry } from './core.ts';
@@ -19,7 +20,11 @@ function history(ctx: ExtensionContext): unknown[] {
 // Registering a separate provider is necessary: Pi routes only to catalog models and discards
 // ad-hoc context metadata on returned model objects. Never register/replace the ollama provider.
 export default async function extension(pi: ExtensionAPI) {
-  const store = new Store(join(process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent'), 'pi-ollama-context.json'));
+  const agentDir = process.env.PI_CODING_AGENT_DIR || join(homedir(), '.pi', 'agent');
+  const store = new Store(join(agentDir, 'pi-ollama-context.json'));
+  const settingsPath = join(agentDir, 'settings.json');
+  let compacting = false;
+  let compactionFailed = false;
   let entries: Record<string, RecordEntry> = {};
   let busy = false;
   let switching = false;
@@ -29,6 +34,15 @@ export default async function extension(pi: ExtensionAPI) {
 
   function selected(ctx: ExtensionContext): RecordEntry | undefined {
     return Object.values(entries).find(r => ctx.model?.provider === PROVIDER && [virtualId(r), r.variant].includes(ctx.model.id));
+  }
+  function paint(ctx: ExtensionContext) {
+    const r = selected(ctx);
+    if (!r) {ctx.ui.setStatus('ollama-context', undefined); return;}
+    const tokens = ctx.getContextUsage()?.tokens;
+    const state = compacting ? 'compacting…' : compactionFailed ? 'compaction failed · /compact' : autoStatus(r, pi.getSettings());
+    let text = usageText(tokens, r.tokens, state);
+    if (ctx.ui.theme && typeof tokens === 'number' && tokens / r.tokens >= (thresholdFor(r) ?? 100) / 100) text = ctx.ui.theme.fg('warning', text);
+    ctx.ui.setStatus('ollama-context', text);
   }
   function original(ctx: ExtensionContext, entry?: RecordEntry): any {
     const model = entry ? ctx.modelRegistry.find('ollama', entry.source) : ctx.model;
@@ -57,7 +71,14 @@ export default async function extension(pi: ExtensionAPI) {
         // Re-read preferences to catch reset/change in another Pi process. Never silently use a stale size.
         const current = (await store.read()).entries[r.key];
         if (!current || current.variant !== r.variant) throw new Error('Context preference changed in another session. Run /context show, then /context with the desired size.');
-        assertFits(request.messages, r.tokens);
+        // A direct route chooses credentials/model for Pi's summary generator;
+        // these messages are the source history, NOT the final summary prompt.
+        // Pi sizes that separate request using the verified physical model limits.
+        if (request.reason !== 'direct') {
+          const last = request.messages.findLast(m => m.role === 'assistant' && m.stopReason !== 'error' && m.stopReason !== 'aborted');
+          const calibrated = last?.role === 'assistant' && last.model === r.variant;
+          assertFits(request.messages, r.tokens, calibrated ? ctx.getContextUsage()?.tokens : undefined);
+        }
         const model = original(ctx, r);
         const api = await client(ctx, model, request.signal);
         await api.verify(r);
@@ -84,27 +105,60 @@ export default async function extension(pi: ExtensionAPI) {
 
   async function restore(_event: unknown, ctx: ExtensionContext) {
     if (switching || busy || !ctx.isIdle()) return;
+    compacting = false; compactionFailed = false;
     if (startupError) { ctx.ui.notify(startupError, 'error'); return; }
     try {
       const r = selected(ctx) ?? (ctx.model?.provider === 'ollama' ? entries[keyFor(endpoint(ctx.model.baseUrl), ctx.model.id)] : undefined);
       if (!r) { ctx.ui.setStatus('ollama-context', undefined); return; }
       if (ctx.model?.id !== virtualId(r)) await select(ctx, r);
-      ctx.ui.setStatus('ollama-context', `context ${r.tokens} · saved; verified before inference`);
+      ctx.ui.setStatus('ollama-context', usageText(ctx.getContextUsage()?.tokens, r.tokens, autoStatus(r, pi.getSettings())));
     } catch (e: any) { ctx.ui.notify(e.message, 'error'); }
   }
   pi.on('session_start', restore);
   pi.on('model_select', restore);
-  // Pi's default 16K compaction reserve otherwise triggers constant compactions at 4K/8K.
-  // Cancel only premature threshold compaction. Overflow/manual compaction stays available.
+  pi.on('before_provider_request', async (event, ctx) => {
+    const r = selected(ctx);
+    const payload = event.payload as Record<string, unknown> | null;
+    if (!r || !payload || typeof payload !== 'object' || payload.model !== r.variant) return;
+    const limits = [payload.max_tokens, payload.max_completion_tokens].filter((n): n is number => typeof n === 'number' && Number.isFinite(n) && n > 0);
+    // Ollama documents max_tokens; Pi's model metadata alone does not bound an
+    // ordinary response. Preserve any tighter caller limit and reserve space.
+    const next: Record<string, unknown> = {...payload, max_tokens: Math.max(1, Math.floor(Math.min(outputBudget(r.tokens), ...limits)))};
+    delete next.max_completion_tokens;
+    return next;
+  });
+  // Pi owns timing, summary generation and session persistence. Our settings only
+  // adjust its per-model reserve/retained-tail budgets; no timer or extra model call.
   pi.on('session_before_compact', async (event, ctx) => {
     const r = selected(ctx);
-    if (!r || event.reason !== 'threshold') return;
-    const usage = ctx.getContextUsage();
-    if (usage?.tokens != null && usage.tokens + outputBudget(r.tokens) + 256 < r.tokens) return {cancel: true};
+    if (!r) return;
+    if (event.reason === 'threshold') {
+      const percent = thresholdFor(r);
+      const tokens = ctx.getContextUsage()?.tokens;
+      if (percent === null || tokens == null || tokens < Math.ceil(r.tokens * percent / 100)) return {cancel: true};
+    }
+    compacting = true; compactionFailed = false; paint(ctx);
   });
+  pi.on('session_compact', async (_event, ctx) => {compacting = false; compactionFailed = false; paint(ctx);});
+  pi.on('session_compact_failed', async (event, ctx) => {
+    compacting = false;
+    if (!selected(ctx)) return;
+    // Our deliberate suppression of an early native threshold isn't a failure.
+    if (!event.aborted) {
+      compactionFailed = true;
+      ctx.ui.notify(`Compaction failed; no successful summary was recorded. ${event.errorMessage ?? 'Try /compact or a larger context.'}`, 'warning');
+    }
+    paint(ctx);
+  });
+  pi.on('message_end', async (_event, ctx) => {paint(ctx);});
+  pi.on('turn_end', async (_event, ctx) => {paint(ctx);});
+  pi.on('agent_end', async (_event, ctx) => {paint(ctx);});
+  pi.on('agent_settled', async (_event, ctx) => {paint(ctx);});
+  pi.on('session_tree', async (_event, ctx) => {paint(ctx);});
+
 
   pi.registerCommand('context', {
-    description: 'Set verified Ollama context: [tokens|4k|8k|16k|32k|64k|show|reset]',
+    description: 'Set verified Ollama context: [tokens|4k|8k|16k|32k|64k|show|reset|auto [1-95|off|show]]',
     async handler(args, ctx) {
       if (busy) { ctx.ui.notify('A context operation is already running; wait for it to finish.', 'warning'); return; }
       busy = true;
@@ -119,9 +173,27 @@ export default async function extension(pi: ExtensionAPI) {
         const saved = entries[key];
         const startSelection = selectionIdentity(ctx);
         let arg = args.trim().toLowerCase();
+        if (arg === 'auto' || arg.startsWith('auto ')) {
+          if (!saved) throw new Error('Set a context first, for example /context 8192.');
+          let value = arg.slice(4).trim();
+          if (!value) {
+            if (!ctx.hasUI) throw new Error('Use /context auto 80, /context auto off, or /context auto show.');
+            const answer = await ctx.ui.select('Auto-compact when context reaches', ['60%', '70%', '80%', '90%', 'Custom percentage', 'Off']);
+            if (!answer) return;
+            value = answer === 'Custom percentage' ? (await ctx.ui.input('Whole percent (1–95)', '80') ?? '') : answer.toLowerCase();
+            if (!value) return;
+          }
+          if (value === 'show') {ctx.ui.notify(usageText(ctx.getContextUsage()?.tokens, saved.tokens, autoStatus(saved, pi.getSettings())), 'info');paint(ctx);return;}
+          const updated = {...saved, autoCompactPercent: parseThreshold(value)};
+          await writeNativeBudget(settingsPath, updated);
+          await store.update(key, updated); entries[key] = updated;
+          ctx.ui.notify(`Saved ${updated.autoCompactPercent === null ? 'auto-compaction off' : `auto-compaction at ${updated.autoCompactPercent}%`} for ${model.id}. Reloading Pi to activate native settings. Project overrides and Pi’s global auto-compaction switch remain authoritative.`, 'info');
+          await ctx.reload();
+          return;
+        }
         if (!arg || arg === 'show') {
-          const loaded = await api.allocation(managed?.variant ?? model.id);
-          const status = `Selected: ${ctx.model?.name ?? model.id}\nOriginal: ${model.id}\nRequested: ${saved?.tokens ?? 'original default'}\n${describeAllocation(loaded)}\nPersistent: ${saved ? 'yes (per model and endpoint)' : 'no override'}`;
+          const loaded = await api.allocation(managed?.variant ?? model.id, managed?.variantDigest);
+          const status = `Selected: ${ctx.model?.name ?? model.id}\nOriginal: ${model.id}\nRequested: ${saved?.tokens ?? 'original default'}\n${describeAllocation(loaded)}\n${saved ? usageText(ctx.getContextUsage()?.tokens, saved.tokens, autoStatus(saved, pi.getSettings())) : 'Set /context SIZE to enable the usage footer and threshold.'}\nPersistent: ${saved ? 'yes (per model and endpoint)' : 'no override'}`;
           if (arg === 'show') { ctx.ui.notify(status, 'info'); return; }
           if (!ctx.hasUI) throw new Error('Interactive selection needs Pi UI; use /context 8192.');
           const choice = await ctx.ui.select(`${status}\nChoose context (larger sizes can reload the model and use more memory)`, PRESETS);
@@ -145,6 +217,7 @@ export default async function extension(pi: ExtensionAPI) {
           switching = true;
           try { if (!await pi.setModel({...model, contextWindow: allocation.context_length})) throw new Error('Pi refused to restore the original model.'); }
           finally { switching = false; }
+          await writeNativeBudget(settingsPath, saved, true);
           await store.update(key);
           delete entries[key];
           pi.unregisterVirtualModel(PROVIDER, virtualId(saved));
@@ -160,14 +233,18 @@ export default async function extension(pi: ExtensionAPI) {
         if (saved?.tokens === tokens && await api.digest(model.id) === saved.sourceDigest && await api.digest(saved.variant).catch(() => '') === saved.variantDigest) result = {entry: saved, allocation: await api.verify(saved)};
         else result = await api.create(model.id, tokens);
         if (selectionIdentity(ctx) !== startSelection || !ctx.isIdle() || ctx.hasPendingMessages()) throw new Error('Model/session activity changed during setup; selection and preference were not changed. Retry when idle.');
+        result.entry.autoCompactPercent = saved?.autoCompactPercent === undefined ? 80 : saved.autoCompactPercent;
         registerPhysical(model, result.entry, api);
         // Persist before selection, so routing always observes a committed preference.
         await store.update(key, result.entry);
         entries[key] = result.entry;
         try { await select(ctx, result.entry); }
         catch (e) { await store.update(key, saved); if (saved) entries[key] = saved; else delete entries[key]; throw e; }
-        ctx.ui.setStatus('ollama-context', `${tokens} tokens · verified · saved`);
+        paint(ctx);
         ctx.ui.notify(`Selected ${model.id} → ${result.entry.variant}\nRequested: ${tokens}\n${describeAllocation(result.allocation)}\nPersistent: yes. Original model unchanged; shared model weights, separate context allocation.`, 'info');
+        await writeNativeBudget(settingsPath, result.entry);
+        ctx.ui.notify('Reloading Pi to apply this model’s native auto-compaction threshold and retained-history budget.', 'info');
+        await ctx.reload();
       } catch (e: any) {
         ctx.ui.setStatus('ollama-context', undefined);
         ctx.ui.notify(e.message, 'error');

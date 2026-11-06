@@ -1,5 +1,5 @@
 import { createServer } from 'node:http';
-import { mkdtemp, rm } from 'node:fs/promises';
+import { mkdtemp, rm, readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import extension from '../src/index.ts';
@@ -9,7 +9,7 @@ export async function fakeOllama() {
   const models = new Map<string, any>([['tiny:latest', {n: 2048, digest: 'sha256:base', maximum: 131072}], ['second:latest', {n: 4096, digest: 'sha256:second', maximum: 131072}]]);
   const loaded = new Map<string, any>();
   const calls: any[] = [];
-  const state = {mismatch: false, offline: false, gpu: false, embeddings: false, unknown: false, streamCalls: 0};
+  const state = {mismatch: false, offline: false, gpu: false, embeddings: false, unknown: false, streamCalls: 0, replies: [] as {content: string; input: number; output: number}[]};
   const server = createServer(async (req, res) => {
     let raw = ''; for await (const chunk of req) raw += chunk;
     const body = raw ? JSON.parse(raw) : undefined;
@@ -34,9 +34,10 @@ export async function fakeOllama() {
     if (path === '/v1/models') return send({object:'list',data:[...models.keys()].map(id=>({id,object:'model',owned_by:'ollama'}))});
     if (path === '/v1/chat/completions') {
       state.streamCalls++;
+      const reply = state.replies.shift() ?? {content:"Hello", input:30, output:1};
       res.setHeader('Content-Type','text/event-stream');
-      res.write(`data: ${JSON.stringify({id:'test',object:'chat.completion.chunk',created:1,model:body.model,choices:[{index:0,delta:{role:'assistant',content:'Hello'},finish_reason:null}]})}\n\n`);
-      res.write(`data: ${JSON.stringify({id:'test',object:'chat.completion.chunk',created:1,model:body.model,choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:30,completion_tokens:1,total_tokens:31}})}\n\n`);
+      res.write(`data: ${JSON.stringify({id:'test',object:'chat.completion.chunk',created:1,model:body.model,choices:[{index:0,delta:{role:'assistant',content:reply.content},finish_reason:null}]})}\n\n`);
+      res.write(`data: ${JSON.stringify({id:'test',object:'chat.completion.chunk',created:1,model:body.model,choices:[{index:0,delta:{},finish_reason:'stop'}],usage:{prompt_tokens:reply.input,completion_tokens:reply.output,total_tokens:reply.input+reply.output}})}\n\n`);
       return res.end('data: [DONE]\n\n');
     }
     res.statusCode=404; send({error:'missing'});
@@ -54,8 +55,10 @@ export async function harness(url: string, existingDir?: string) {
   const commands=new Map<string,any>(), hooks=new Map<string,any[]>(), virtual=new Map<string,any>();
   const notices:any[]=[], statuses:any[]=[], registrations:string[]=[];
   let choice: string | undefined, input: string | undefined;
-  const ctx:any={model:base('tiny:latest'),hasUI:true,isIdle:()=>true,hasPendingMessages:()=>false,getSystemPrompt:()=>'',getContextUsage:()=>({tokens:20}),sessionManager:{getSessionId:()=>'test-session',getLeafId:()=>'test-leaf',buildSessionContext:()=>({messages:[]})},modelRegistry:{find:(p:string,id:string)=>models.get(`${p}/${id}`),getApiKeyAndHeaders:async()=>({ok:true,apiKey:'test-key'})},ui:{select:async()=>choice,input:async()=>input,notify:(text:string,level:string)=>notices.push({text,level}),setStatus:(...s:any[])=>statuses.push(s)}};
-  const pi:any={registerCommand:(n:string,c:any)=>commands.set(n,c),on:(n:string,h:any)=>hooks.set(n,[...(hooks.get(n)??[]),h]),registerVirtualModel:(v:any)=>{virtual.set(v.id,v);models.set(`${v.provider}/${v.id}`,{...v,api:'pi-virtual'});},unregisterVirtualModel:(p:string,id:string)=>{models.delete(`${p}/${id}`);virtual.delete(id);},registerProvider:(p:string,c:any)=>{registrations.push(p);for(const m of c.models)models.set(`${p}/${m.id}`,{...m,provider:p});},setModel:async(m:any)=>{ctx.model=m;for(const h of hooks.get('model_select')??[])await h({},ctx);return true;}};
+  let settings:any = {};
+  const reload = async () => {settings = JSON.parse(await readFile(join(dir, 'settings.json'), 'utf8'));};
+  const ctx:any={reload,model:base('tiny:latest'),hasUI:true,isIdle:()=>true,hasPendingMessages:()=>false,getSystemPrompt:()=>'',getContextUsage:()=>({tokens:20}),sessionManager:{getSessionId:()=>'test-session',getLeafId:()=>'test-leaf',buildSessionContext:()=>({messages:[]})},modelRegistry:{find:(p:string,id:string)=>models.get(`${p}/${id}`),getApiKeyAndHeaders:async()=>({ok:true,apiKey:'test-key'})},ui:{select:async()=>choice,input:async()=>input,notify:(text:string,level:string)=>notices.push({text,level}),setStatus:(...s:any[])=>statuses.push(s)}};
+  const pi:any={getSettings:()=>settings,registerCommand:(n:string,c:any)=>commands.set(n,c),on:(n:string,h:any)=>hooks.set(n,[...(hooks.get(n)??[]),h]),registerVirtualModel:(v:any)=>{virtual.set(v.id,v);models.set(`${v.provider}/${v.id}`,{...v,api:'pi-virtual'});},unregisterVirtualModel:(p:string,id:string)=>{models.delete(`${p}/${id}`);virtual.delete(id);},registerProvider:(p:string,c:any)=>{registrations.push(p);for(const m of c.models)models.set(`${p}/${m.id}`,{...m,provider:p});},setModel:async(m:any)=>{ctx.model=m;for(const h of hooks.get('model_select')??[])await h({},ctx);return true;}};
   try {await extension(pi);} finally {if(prior===undefined)delete process.env.PI_CODING_AGENT_DIR;else process.env.PI_CODING_AGENT_DIR=prior;}
   return {dir,ctx,pi,commands,hooks,virtual,notices,statuses,registrations,choose:(v?:string,i?:string)=>{choice=v;input=i;},run:(s:string)=>commands.get('context').handler(s,ctx),route:()=>virtual.get(ctx.model.id).route({messages:[],thinkingLevel:'off'},ctx),close:()=>existingDir?Promise.resolve():rm(dir,{recursive:true,force:true})};
 }

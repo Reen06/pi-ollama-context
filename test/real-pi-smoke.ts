@@ -20,11 +20,20 @@ try{
  await cmd('prompt',{message:'/context 8192'});
  const state=await cmd('get_state');assert.equal(state.data.model.contextWindow,8192,JSON.stringify(events.slice(-8)));assert.equal(state.data.model.provider,'ollama-context',JSON.stringify(events.slice(-10)));
  await cmd('prompt',{message:'/ollama-refresh'});
- await cmd('prompt',{message:'Say hello.'});
+ const autoPercent=process.env.TEST_AUTO_PERCENT;
+ if(autoPercent)await cmd('prompt',{message:`/context auto ${autoPercent}`});
+ await cmd('prompt',{message:autoPercent ? 'Remember this project brief. Build an offline document viewer with a searchable list, a blue save button, a compact sidebar, and a keyboard shortcut for search. The files remain on the local drive. Users can create folders, rename notes, and export a ZIP archive. Search should ignore case and match partial words. The app should remember the last open folder, preserve unsaved changes, and show a clear error when a file is unavailable. We will add image previews later. The initial release is text only. A settings dialog will contain theme and text-size controls. No cloud account is required. Reply with only OK.' : 'Say hello.'});
  for(let i=0;i<1200&&!events.some(e=>e.type==='agent_end');i++)await new Promise(r=>setTimeout(r,100));
  const end=events.find(e=>e.type==='agent_end');assert.ok(end,JSON.stringify(events.slice(-10)));
  const answer=end.messages.filter((m:any)=>m.role==='assistant').at(-1);assert.equal(answer.stopReason,'stop',JSON.stringify(answer));
+ if(autoPercent){
+   for(let i=0;i<100&&!events.some(e=>e.type==='agent_settled');i++)await new Promise(r=>setTimeout(r,25));
+   if (!events.some(e=>e.type==='compaction_end')) await cmd('prompt',{message:'Add these requirements to the earlier brief. Support dragging files into the window, sorting documents by name or date, and selecting several notes for export. Keep import errors visible without interrupting other work. The status bar should show the current folder and the number of selected files. A read-only preview must never modify the source file. Keep the existing offline behavior and the blue save button. Reply with only OK.'});
+   for(let i=0;i<1200&&!events.some(e=>e.type==='compaction_end');i++)await new Promise(r=>setTimeout(r,100));
+   assert.ok(events.some(e=>e.type==='compaction_end' && e.result), JSON.stringify(events.slice(-15)));
+   assert.ok(events.some(e=>e.type==='extension_ui_request' && e.statusText?.includes('usage unknown')));
+ }
  const prefs=JSON.parse(await readFile(join(dir,'pi-ollama-context.json'),'utf8'));const saved:any=Object.values(prefs.entries)[0];
- const ps:any=await (await fetch(`${TEST_OLLAMA_URL}/api/ps`)).json();const allocation=ps.models.find((m:any)=>m.name===saved.variant);assert.equal(allocation.context_length,8192);
- console.log(JSON.stringify({pi:'1.3.0',discovery:'1.0.3',model:TEST_OLLAMA_MODEL,context:allocation.context_length,size_vram:allocation.size_vram,assistantStopReason:answer.stopReason,refreshPreserved:true},null,2));
+ const ps:any=await (await fetch(`${TEST_OLLAMA_URL}/api/ps`)).json();const allocation=ps.models.find((m:any)=>m.name===saved.variant || m.digest===saved.variantDigest);assert.equal(allocation.context_length,8192);
+ console.log(JSON.stringify({pi:'1.3.0',discovery:'1.0.3',model:TEST_OLLAMA_MODEL,context:allocation.context_length,size_vram:allocation.size_vram,assistantStopReason:answer.stopReason,refreshPreserved:true,autoCompactionPercent:autoPercent??null,nativeSummarySaved:autoPercent?true:undefined},null,2));
 }finally{for(const p of waiting.values())clearTimeout(p.timer);child.kill('SIGTERM');await new Promise(r=>child.once('exit',r));await rm(home,{recursive:true,force:true});}

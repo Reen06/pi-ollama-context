@@ -20,18 +20,20 @@ export function endpoint(baseUrl: string): string {
 export const canonical = (name: string) => name.slice(name.lastIndexOf('/') + 1).includes(':') ? name : `${name}:latest`;
 export const keyFor = (url: string, model: string) => createHash('sha256').update(`${url}\n${canonical(model)}`).digest('hex').slice(0, 24);
 export const outputBudget = (n: number) => Math.max(128, Math.min(2048, Math.floor(n / 8)));
-export function assertFits(messages: unknown, size: number): void {
+export function assertFits(messages: unknown, size: number, estimatedTokens?: number | null): void {
   // A conservative UTF-8 byte bound, not a pretend exact tokenizer. Includes tool schemas.
   const text = JSON.stringify(messages);
   if (/"type"\s*:\s*"(?:image|audio)"/.test(text)) throw new Error('Context safety for image/audio inputs is not supported yet. Use a text-only conversation.');
-  const bound = Buffer.byteLength(text, 'utf8') + 256 + outputBudget(size);
-  if (bound > size) throw new Error(`Conversation safety bound (${bound} tokens including output reserve) exceeds ${size}. Keep the larger context, use /compact there, or start /new. Nothing was truncated. This conservative byte bound can reject text that a model-specific tokenizer would fit.`);
+  const measured = typeof estimatedTokens === 'number' && Number.isFinite(estimatedTokens) && estimatedTokens >= 0;
+  const bound = (measured ? Math.ceil(estimatedTokens) : Buffer.byteLength(text, 'utf8')) + 256 + outputBudget(size);
+  if (bound > size) throw new Error(`Conversation ${measured ? 'Pi usage estimate' : 'safety bound'} (${bound} tokens including output reserve) exceeds ${size}. Keep the larger context, use /compact there, or start /new. Nothing was truncated. ${measured ? 'Pi estimates trailing content; this is not an exact tokenizer.' : 'This conservative byte bound can reject text that a model-specific tokenizer would fit.'}`);
 }
-export interface RecordEntry { key: string; endpoint: string; source: string; sourceDigest: string; variant: string; variantDigest: string; tokens: number; }
+export interface RecordEntry { key: string; endpoint: string; source: string; sourceDigest: string; variant: string; variantDigest: string; tokens: number; autoCompactPercent?: number | null; }
 export interface Settings { version: 1; entries: Record<string, RecordEntry>; }
 function validateSettings(value: any): Settings {
   if (value?.version !== 1 || !value.entries || typeof value.entries !== 'object' || Array.isArray(value.entries)) throw new Error('Invalid context settings file; restore its backup or rename it before retrying.');
   for (const [k, r] of Object.entries(value.entries) as [string, any][]) {
+    if (r?.autoCompactPercent !== undefined && r.autoCompactPercent !== null && (!Number.isInteger(r.autoCompactPercent) || r.autoCompactPercent < 1 || r.autoCompactPercent > 95)) throw new Error('Invalid auto-compaction threshold in context settings.');
     if (!r || r.key !== k || typeof r.endpoint !== 'string' || typeof r.source !== 'string' || typeof r.variant !== 'string' || typeof r.sourceDigest !== 'string' || typeof r.variantDigest !== 'string' || parseContext(String(r.tokens)) !== r.tokens || keyFor(r.endpoint, r.source) !== k || endpoint(`${r.endpoint}/v1`) !== r.endpoint) throw new Error('Invalid context settings entry. Settings were not overwritten.');
   }
   return value;
@@ -85,20 +87,21 @@ export class Ollama {
     if (!tag?.digest) throw new Error(`Model ${model} is not installed on the selected server. Install it first; /context never pulls models.`);
     return tag.digest;
   }
-  async allocation(model: string): Promise<Allocation | undefined> {
+  async allocation(model: string, digest?: string): Promise<Allocation | undefined> {
     const ps = await this.call('/api/ps');
-    return ps.models?.find((m: any) => canonical(m.name ?? m.model) === canonical(model));
+    return ps.models?.find((m: any) => canonical(m.name ?? m.model) === canonical(model))
+      ?? (digest ? ps.models?.find((m: any) => m.digest === digest) : undefined);
   }
   async verify(entry: RecordEntry): Promise<Allocation> {
     if (await this.digest(entry.source) !== entry.sourceDigest) throw new Error('The original model changed. Run /context with the desired size again to create a fresh variant.');
     if (await this.digest(entry.variant) !== entry.variantDigest) throw new Error('The managed variant was replaced. Run /context with the desired size again.');
     const info = await this.info(entry.variant);
     if (parameterContext(info.parameters) !== entry.tokens) throw new Error('The variant no longer has the requested num_ctx. Run /context with the desired size again.');
-    let allocation = await this.allocation(entry.variant);
+    let allocation = await this.allocation(entry.variant, entry.variantDigest);
     if (!allocation || allocation.context_length !== entry.tokens) {
       // No num_ctx override: verify the saved model default, including after an eviction/restart.
       await this.call('/api/generate', {model: entry.variant, stream: false, keep_alive: '5m'});
-      allocation = await this.allocation(entry.variant);
+      allocation = await this.allocation(entry.variant, entry.variantDigest);
     }
     if (!allocation || allocation.context_length !== entry.tokens) throw new Error(`Requested ${entry.tokens}, but Ollama reports ${allocation?.context_length ?? 'unknown'} allocated tokens. Not applied. Check server limits/version and available memory; no fallback size was accepted.`);
     if (allocation.digest && allocation.digest !== entry.variantDigest) throw new Error('Loaded model digest differs from the verified variant. Retry after checking concurrent Ollama clients.');

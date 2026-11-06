@@ -46,13 +46,45 @@ try {
     for(let i=0;i<100 && !p.events.some(e=>e.type==='agent_end');i++)await new Promise(r=>setTimeout(r,50));
     assert.equal(server.state.streamCalls,count+1,`No inference: ${JSON.stringify(p.events.slice(-20))}`);
     const sent=server.calls.filter(c=>c.path==='/v1/chat/completions').at(-1);
-    assert.ok(sent.body.model.includes('-ctx8k-'));assert.equal(sent.headers.authorization,'Bearer test-key');
+    assert.equal(sent.body.max_tokens,1024);assert.equal(sent.body.max_completion_tokens,undefined);assert.ok(sent.body.model.includes('-ctx8k-'));assert.equal(sent.headers.authorization,'Bearer test-key');
     assert.equal((await p.cmd('get_state')).data.model.contextWindow,8192);
     await p.cmd('set_model',{provider:'ollama',modelId:'second:latest'});
     await p.cmd('prompt',{message:'/context 16k'});
     assert.equal((await p.cmd('get_state')).data.model.contextWindow,16384);
     await p.cmd('set_model',{provider:'ollama',modelId:'tiny:latest'});
     assert.equal((await p.cmd('get_state')).data.model.contextWindow,8192);
+    // Exercise Pi's actual native compaction engine, not just a threshold helper.
+    await p.cmd('new_session');await p.cmd('set_model',{provider:'ollama',modelId:'tiny:latest'});
+    await p.cmd('prompt',{message:'/context auto 80'});
+    await p.cmd('prompt',{message:'/context auto show'});
+    assert.ok(JSON.stringify(p.events.slice(-8)).includes('auto 80%'), JSON.stringify(p.events.slice(-16)));
+    const startCalls=server.state.streamCalls;
+    server.state.replies.push({content:'A'.repeat(2500),input:3999,output:1},{content:'B'.repeat(2500),input:6553,output:1},{content:'A concise summary of the earlier exchange.',input:100,output:10});
+    async function turn(text:string) {
+      const start=p.events.length;
+      await p.cmd('prompt',{message:text});
+      for(let i=0;i<200 && !p.events.slice(start).some(e=>e.type==='agent_settled');i++)await new Promise(r=>setTimeout(r,25));
+      return p.events.slice(start);
+    }
+    const low=await turn('First exchange.');
+    assert.equal(server.state.streamCalls,startCalls+1);
+    assert.ok(!low.some(e=>e.type==='compaction_start'));
+    assert.ok(JSON.stringify(low).includes('4,000'));
+    const high=await turn('Second exchange.');
+    const compacted=high.find(e=>e.type==='compaction_end' && e.result);
+    assert.ok(compacted,`Expected native compaction at 6554/8192: ${JSON.stringify(high).slice(-9000)}`);
+    assert.ok(server.state.streamCalls >= startCalls+3 && server.state.streamCalls <= startCalls+4); // Split turns may require two native summaries.
+    assert.ok(JSON.stringify(high).includes('usage unknown'));
+    assert.ok(!JSON.stringify(high).includes('compaction failed'));
+    // Disabling our threshold leaves manual compaction available.
+    await p.cmd('new_session');await p.cmd('set_model',{provider:'ollama',modelId:'tiny:latest'});await p.cmd('prompt',{message:'/context auto off'});
+    const offCalls=server.state.streamCalls;
+    server.state.replies.push({content:'C'.repeat(2500),input:3999,output:1},{content:'D'.repeat(2500),input:6553,output:1});
+    await turn('First exchange.');const off=await turn('Second exchange.');
+    assert.equal(server.state.streamCalls,offCalls+2);assert.ok(!off.some(e=>e.type==='compaction_start'));
+    assert.equal((await p.cmd('compact')).success,true);
+    await p.cmd('new_session');await p.cmd('set_model',{provider:'ollama',modelId:'tiny:latest'});await p.cmd('prompt',{message:'/context auto 70'});
+    await p.cmd('prompt',{message:'/context auto show'});assert.ok(JSON.stringify(p.events.slice(-8)).includes('auto 70%'));
     // A failed verification must end the turn without sending ANY inference request.
     server.loaded.clear();server.state.mismatch=true;const before=server.state.streamCalls;
     const eventStart=p.events.length;await p.cmd('prompt',{message:'Test failure.'});
@@ -61,6 +93,6 @@ try {
     assert.ok(JSON.stringify(p.events.slice(eventStart)).includes('Not applied'));
     server.state.mismatch=false;
     await p.stop();
-    console.log(`PASS: real Pi + pi-ollama, ${reverse?'discovery first':'context first'}, UI, actual request target/auth, refresh, switching, persistence, fail-closed routing`);
+    console.log(`PASS: real Pi + pi-ollama, ${reverse?'discovery first':'context first'}, UI, actual request target/auth, refresh, switching, persistence, fail-closed routing, native 80% compaction, usage footer, auto off/manual, custom threshold`);
   }
 } finally {child?.kill('SIGTERM');await server.close();await rm(home,{recursive:true,force:true});}

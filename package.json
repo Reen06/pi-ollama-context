@@ -1,7 +1,7 @@
 {
   "name": "pi-ollama-context",
-  "version": "0.1.0",
-  "description": "Verified, persistent Ollama context windows from Pi's /context command",
+  "version": "0.2.0",
+  "description": "Verified Ollama context windows, usage footer and configurable native auto-compaction for Pi",
   "type": "module",
   "license": "MIT",
   "author": "Reen06",

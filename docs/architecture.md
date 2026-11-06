@@ -1,10 +1,10 @@
 # Architecture
 
-The extension has two modules, uses Node built-ins and fetch, and has no runtime
+The extension has three modules, uses Node built-ins and fetch, and has no runtime
 package dependencies. `core.ts` handles parsing, endpoint selection, atomic
 preferences, native Ollama operations and allocation verification. `index.ts`
 uses Pi's official TypeScript API for a command, built-in dialogs, model routing,
-session/model selection hooks, and a narrow small-context compaction hook.
+session/model selection hooks, and native per-model compaction settings. `usage.ts` formats the usage footer and safely updates only managed model compaction keys.
 
 ## Change transaction
 
@@ -37,7 +37,7 @@ back to physical catalog entries, discarding ad-hoc returned metadata.
 
 Therefore `ollama-context` contains physical derived entries with verified
 limits and a virtual selection per original model/endpoint. A route checks the
-committed preference, conversation budget, current source/variant digests,
+committed preference, conversation budget (Pi usage after a matching model response, otherwise a conservative byte bound), current source/variant digests,
 persisted parameter and live allocation, then refreshes its physical entry using
 the original model's transport, current credentials, URL and compatibility flags.
 It never replaces `ollama`, implements a duplicate inference transport, or adds
@@ -81,3 +81,33 @@ explicit user operation using Ollama; the extension has no delete API call.
 
 Endpoint failures, authorization failures, unknown limits, allocation mismatch,
 changed digests and unsafe histories all leave the original model intact.
+
+## Native compaction integration (0.2.0)
+
+`/context auto PERCENT` persists a per-model preference and writes `reserveTokens`
+and `keepRecentTokens` overrides for both the virtual and physical catalog keys.
+The reserve implements Pi's strict `tokens > window - reserve` trigger at the first
+integer token count at/above the requested percentage. The retained-history budget
+is `floor(window * min(percent/200, 1/16))`; a smaller tail makes summarization
+possible with small contexts. Off cancels only threshold compaction, not manual or
+overflow recovery. Pi still needs enough source history to find a valid cut point.
+
+Settings edits acquire the same `.lock` directory convention as Pi's file storage,
+read fresh JSON, preserve unrelated keys, save a private backup and atomically
+replace the file. The command invokes Pi's official reload method, then returns
+without using the stale context. Global disabled state and project overrides are
+respected and shown. No extension timer, model-facing tool or replacement summarizer
+is introduced. An upgrade's existing preferences show pending until configured.
+
+The status uses `ctx.getContextUsage()` and the managed capacity, updating at
+message/turn/compaction/session events. Native usage is an estimate, can exceed
+100%, and is unknown immediately after compaction. Those states are displayed
+without clamping or inventing precision. Native summary routing continues to
+verify Ollama allocation, but doesn't apply the normal request byte-bound to the
+source history: Pi constructs and budgets a separate summary request afterwards.
+
+Managed ordinary inference payloads explicitly use Ollama’s documented `max_tokens`
+field, capped at the response reserve and preserving a tighter caller limit. This
+is a convenience payload hook, not a security boundary against other extensions
+that subsequently rewrite the payload. Allocation verification remains in the
+fail-closed virtual route.

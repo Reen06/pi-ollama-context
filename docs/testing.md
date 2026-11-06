@@ -2,7 +2,7 @@
 
 ## Automated tests
 
-- 26 Node tests, no installed dependencies: interactive preset/custom/cancel,
+- 39 Node tests, no installed dependencies: interactive preset/custom/cancel,
   numeric parsing, invalid/unsupported inputs, persistence, restart, multiple
   models, endpoint isolation, private settings, lock/corruption handling, safe
   history rejection, busy sessions, reset retention, CPU/GPU status, unload/reload,
@@ -63,3 +63,25 @@ covered. Real tests are opt-in rather than downloading model weights in CI.
   archive SHA-256 `dc5eabc292f9949546c90a97c820f924b035e05243b0de13c7f366182562169c`.
 - CI actions are pinned to full upstream commits; Node is pinned to 22.22.2.
   Checksums identify reviewed artifacts; they are not a claim of universal safety.
+
+## 0.2.0 additions
+
+Threshold parser/boundaries, exact native reserve arithmetic, current-vs-cumulative
+usage formatting, unknown usage, private settings backups, shared settings locks,
+corruption handling, unrelated/global settings preservation, custom threshold
+persistence, selector/custom/off behavior, project override status and compaction
+success/failure states are covered by the expanded unit suite.
+
+The real Pi RPC suite now drives deterministic provider usage from below 80% to
+6,554 / 8,192 tokens, verifies native summary requests and a saved compaction result,
+checks the footer's unknown post-compaction count, disables the threshold and proves
+manual compaction still works. Both extension registration orders pass. Provider
+usage is simulated in this suite; this proves Pi scheduling and integration, not
+real-model tokenizer counts.
+
+A real CPU Ollama run additionally set a custom 1% test threshold (to exercise the
+path quickly), exchanged real messages, recorded a native compaction result,
+showed unknown usage afterward and verified the allocation remained 8,192 tokens.
+This used Pi 1.3.0, pi-ollama 1.0.3 and SmolLM2 135M; no claim is made about the
+quality of that tiny model’s summary. The unit and real Pi request tests also
+check the explicit `max_tokens` output limit.
